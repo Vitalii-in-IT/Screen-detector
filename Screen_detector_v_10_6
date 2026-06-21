@@ -1,0 +1,295 @@
+import sys
+import json
+import urllib.request
+from PyQt6 import QtCore, QtGui, QtWidgets
+from PIL import Image, ImageChops
+
+class TransparentFrame(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Transparent frame")
+        self.setMinimumSize(QtCore.QSize(50, 50))
+        self.resize(500, 400)
+
+        self.setWindowFlags(QtCore.Qt.WindowType.FramelessWindowHint | QtCore.Qt.WindowType.WindowStaysOnTopHint)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        self.setMouseTracking(True)
+        self._border_width = 8  
+        self._drag_position = None
+        self._resize_mode = None
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        pen = QtGui.QPen(QtGui.QColor(255, 0, 0, 255))  
+        pen.setWidth(4)                                 
+        painter.setPen(pen)
+        painter.drawRect(2, 2, self.width() - 4, self.height() - 4)
+
+    def grab_inner_content(self):
+        """Takes a screenshot strictly INSIDE the red frame with some margin (protection against false alarms from the outside)"""
+        screen = QtWidgets.QApplication.primaryScreen()
+        if not screen:
+            return None
+        
+        # We get the global coordinates of the window on the screen
+        geo = self.geometry()
+        
+        # Increase the indent to 12 pixels (Safe Zone). 
+        # Anything that happens outside the frame and on the frame itself is guaranteed to be ignored.
+        safe_margin = 12 
+        
+        x = geo.x() + safe_margin
+        y = geo.y() + safe_margin
+        w = geo.width() - (safe_margin * 2)
+        h = geo.height() - (safe_margin * 2)
+        
+        if w <= 0 or h <= 0:
+            return None
+            
+        # Capture a portion of the screen and convert it to a Pillow Image
+        qpixmap = screen.grabWindow(0, x, y, w, h)
+        qimage = qpixmap.toImage()
+        
+        # Converting QImage to PIL Image format for analysis
+        buffer = qimage.bits().asstring(qimage.sizeInBytes())
+        img = Image.frombuffer("RGBA", (qimage.width(), qimage.height()), buffer, "raw", "BGRA", 0, 1)
+        return img.convert("RGB")
+
+    # --- Move and resize logic (no changes) ---
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            self._resize_mode = self._get_resize_mode(pos)
+            if self._resize_mode == "move":
+                self._drag_position = pos - self.frameGeometry().topLeft()
+            else:
+                self._drag_position = event.globalPosition().toPoint()
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        g_pos = event.globalPosition().toPoint()
+        if not event.buttons():
+            mode = self._get_resize_mode(pos)
+            if mode in ["left", "right"]: self.setCursor(QtCore.Qt.CursorShape.SizeHorCursor)
+            elif mode in ["top", "bottom"]: self.setCursor(QtCore.Qt.CursorShape.SizeVerCursor)
+            elif mode in ["top-left", "bottom-right"]: self.setCursor(QtCore.Qt.CursorShape.SizeFDiagCursor)
+            elif mode in ["top-right", "bottom-left"]: self.setCursor(QtCore.Qt.CursorShape.SizeBDiagCursor)
+            else: self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+            return
+
+        if event.buttons() == QtCore.Qt.MouseButton.LeftButton and self._drag_position:
+            if self._resize_mode == "move":
+                self.move(g_pos - self._drag_position)
+            else:
+                rect = self.geometry()
+                diff = g_pos - self._drag_position
+                self._drag_position = g_pos
+                if "left" in self._resize_mode: rect.setLeft(rect.left() + diff.x())
+                if "right" in self._resize_mode: rect.setRight(rect.right() + diff.x())
+                if "top" in self._resize_mode: rect.setTop(rect.top() + diff.y())
+                if "bottom" in self._resize_mode: rect.setBottom(rect.bottom() + diff.y())
+                if rect.width() >= self.minimumWidth() and rect.height() >= self.minimumHeight():
+                    self.setGeometry(rect)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_position = None
+        self._resize_mode = None
+        self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+
+    def _get_resize_mode(self, pos):
+        w, h = self.width(), self.height()
+        b = self._border_width
+        left, right = pos.x() < b, pos.x() > w - b
+        top, bottom = pos.y() < b, pos.y() > h - b
+        if left and top: return "top-left"
+        if right and top: return "top-right"
+        if left and bottom: return "bottom-left"
+        if right and bottom: return "bottom-right"
+        if left: return "left"
+        if right: return "right"
+        if top: return "top"
+        if bottom: return "bottom"
+        if pos.x() < 15 or pos.x() > w - 15 or pos.y() < 15 or pos.y() > h - 15: return "move"
+        return None
+
+
+class ControlWindow(QtWidgets.QWidget):
+    def __init__(self, frame_instance):
+        super().__init__()
+        self.frame = frame_instance  
+        self.is_running = False      
+        self.CONFIG_FILE = "config.json"  
+        
+        # Variables for motion detection
+        self.last_frame = None  # We will store the previous screenshot here.
+        self.motion_timer = QtCore.QTimer()  # Timer for periodic screen check
+        self.motion_timer.timeout.connect(self.check_for_motion)
+        
+        self.setWindowTitle("Screen detector v10.6")
+        self.resize(320, 200)        
+        self.setWindowFlags(QtCore.Qt.WindowType.WindowStaysOnTopHint) 
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(10)
+        layout.setContentsMargins(15, 15, 15, 15)
+
+        self.lbl_token = QtWidgets.QLabel("TG Bot Token:", self)
+        self.lbl_token.setFont(QtGui.QFont("Arial", 10, QtGui.QFont.Weight.Bold))
+        self.input_token = QtWidgets.QLineEdit(self)
+        self.input_token.setPlaceholderText("123456789:ABCdefGhIJK...")
+        self.input_token.setStyleSheet("padding: 6px; border: 1px solid #ccc; border-radius: 4px;")
+
+        self.lbl_chat = QtWidgets.QLabel("Channel or Group ID (or @username):", self)
+        self.lbl_chat.setFont(QtGui.QFont("Arial", 10, QtGui.QFont.Weight.Bold))
+        self.input_chat = QtWidgets.QLineEdit(self)
+        self.input_chat.setPlaceholderText("@my_channel or -100123456789")
+        self.input_chat.setStyleSheet("padding: 6px; border: 1px solid #ccc; border-radius: 4px;")
+
+        self.btn_start = QtWidgets.QPushButton("START MONITORING", self)
+        self.btn_start.setFont(QtGui.QFont("Arial", 11, QtGui.QFont.Weight.Bold))
+        self.btn_start.setStyleSheet("background-color: #28a745; color: white; padding: 10px; border-radius: 5px;")
+        self.btn_start.clicked.connect(self.toggle_monitoring)
+
+        layout.addWidget(self.lbl_token)
+        layout.addWidget(self.input_token)
+        layout.addWidget(self.lbl_chat)
+        layout.addWidget(self.input_chat)
+        layout.addSpacing(5) 
+        layout.addWidget(self.btn_start)
+
+    def load_settings(self):
+        try:
+            with open(self.CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self.input_token.setText(data.get("token", ""))
+                self.input_chat.setText(data.get("chat_id", ""))
+                print("[INFO] Settings loaded successfully.")
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print(f"[ERROR] Error loading JSON: {e}")
+
+    def save_settings(self, token, chat_id):
+        data = {"token": token, "chat_id": chat_id}
+        try:
+            with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            print(f"[ERROR] Failed to save JSON: {e}")
+
+    def send_telegram_message(self, token, chat_id, text):
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = json.dumps({"chat_id": chat_id, "text": text}).encode('utf-8')
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=5) as response:
+                res = json.loads(response.read().decode())
+                return res.get("ok", False)
+        except Exception as e:
+            print(f"[ERROR] Error sending to TG: {e}")
+            return False
+
+    def check_for_motion(self):
+        """A method with adjustable sensitivity for filtering shadows and noise"""
+        current_frame = self.frame.grab_inner_content()
+        if current_frame is None:
+            return
+
+        if self.last_frame is not None:
+            if self.last_frame.size == current_frame.size:
+                # 1. Finding the absolute difference between frames
+                diff = ImageChops.difference(self.last_frame, current_frame)
+                
+                # 2. Filter noise/shadows (color difference > 25)
+                filtered_diff = diff.convert("L").point(lambda x: 255 if x > 25 else 0)
+                
+                # 3. FIXED AND FASTER PIXEL COUNTING
+                # getcolors() returns a list of tuples of the form: [(quantity, color), ...]
+                colors = filtered_diff.getcolors()
+                
+                changed_pixels = 0
+                if colors:
+                    for count, color in colors:
+                        if color == 255:  # If the pixel color is white (meaning there was movement)
+                            changed_pixels = count
+                            break
+                
+                # Setting sensitivity (object size in pixels)
+                trigger_area = 120 
+                
+                if changed_pixels > trigger_area:
+                    print(f"[MOTION] Movement! Pixels changed.: {changed_pixels} (threshold: {trigger_area})")
+                    self.motion_timer.stop()
+                    
+                    token = self.input_token.text().strip()
+                    chat_id = self.input_chat.text().strip()
+                    
+                    self.send_telegram_message(token, chat_id, "⚠️ Movement detected inside the frame!")
+                    
+                    self.motion_timer.start(2000)  # 2-second pause against spam
+            else:
+                print("[INFO] The frame size has changed, we are adapting the frame...")
+        
+        self.last_frame = current_frame
+
+    def toggle_monitoring(self):
+        if not self.is_running:
+            token = self.input_token.text().strip()
+            chat_id = self.input_chat.text().strip()
+
+            if not token or not chat_id:
+                QtWidgets.QMessageBox.warning(self, "Filling error", "Please fill in both fields!")
+                return
+
+            msg = "🟢 Start"
+            if not self.send_telegram_message(token, chat_id, msg):
+                QtWidgets.QMessageBox.warning(self, "Telegram error", "Failed to send notification.")
+                return
+
+            self.save_settings(token, chat_id)
+            self.is_running = True
+            
+            # --- START DETECTION ---
+            self.last_frame = self.frame.grab_inner_content() # Taking the first reference shot
+            self.motion_timer.start(500) # Check every 500 milliseconds (2 times per second)
+            print("[INFO] Motion monitoring is activated.")
+            
+            self.btn_start.setText("STOP MONITORING")
+            self.btn_start.setStyleSheet("background-color: #dc3545; color: white; padding: 10px; border-radius: 5px;")
+            self.input_token.setEnabled(False)
+            self.input_chat.setEnabled(False)
+            
+        else:
+            self.is_running = False
+            
+            # --- STOP DETECTION ---
+            self.motion_timer.stop()
+            self.last_frame = None
+            print("[INFO] Traffic monitoring has been stopped.")
+            
+            token = self.input_token.text().strip()
+            chat_id = self.input_chat.text().strip()
+            self.send_telegram_message(token, chat_id, "🔴 Stop")
+            
+            self.btn_start.setText("START MONITORING")
+            self.btn_start.setStyleSheet("background-color: #28a745; color: white; padding: 10px; border-radius: 5px;")
+            self.input_token.setEnabled(True)
+            self.input_chat.setEnabled(True)
+
+    def closeEvent(self, event):
+        self.motion_timer.stop()
+        self.frame.close()
+        event.accept()
+
+
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    frame = TransparentFrame()
+    frame.show()
+    control = ControlWindow(frame)
+    control.load_settings()  
+    control.show()
+    sys.exit(app.exec())
