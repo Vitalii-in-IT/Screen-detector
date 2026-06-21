@@ -1,9 +1,6 @@
-# Screen-detector
-Lightweight PyQt6 &amp; Pillow desktop application that monitors real-time screen activity within an adaptive, resizable transparent overlay. Instantly dispatches motion detection alerts and updates to a specified Telegram channel or group.
-
 # Screen Motion Detector for Telegram
 
-An adaptive, transparent overlay software designed to monitor real-time motion or visual updates within a specified screen boundary and automatically dispatch alerts to a designated Telegram channel or group.
+Lightweight PyQt6 & Pillow desktop application that monitors real-time screen activity within an adaptive, resizable transparent overlay. Instantly dispatches motion detection alerts and updates to a specified Telegram channel or group.
 
 ## Features
 
